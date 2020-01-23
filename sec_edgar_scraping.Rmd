@@ -1,0 +1,213 @@
+---
+title: "SEC Edgar Data Mining"
+author: "Colby Wilkinson"
+date: "8/31/2019"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+### Scraping 10-K filings from SEC Edgar
+
+The goal of this code is scrape incorporation state from 10-K filings filed with the SEC: https://www.sec.gov/edgar.shtml
+
+Some of the code is adapted from the R 'edgar' package: https://cran.r-project.org/web/packages/edgar/edgar.pdf
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# tidyverse is used for data manipulation and formatting
+library(tidyverse)
+# stringdist is used later on when we want to check for state mispellings
+library(stringdist)
+# knitr is used to reference functions saved in the src directory
+library(knitr)
+```
+
+First we will use quarterly index files to construct a dataframe of all the 10-K filings from 1994 to 2019.  Quarterly index files are located here: https://www.sec.gov/Archives/edgar/full-index/ 
+
+The funciton for creating the filing index data frame is loaded below
+
+```{r, message=FALSE, error=FALSE, warning=FALSE}
+source("./src/getIndex.R")
+```
+
+Inputs
+* Range of years (ex. 1994:1995)
+* Quarters 1, 2, 3 or 4 (ex. 1:3)
+* Form types (ex. c("10-K"))
+
+Output: dataframe with 
+
+* Central Index Key (CIK)
+* Company Name (company.name)
+* Form Type (form.type)
+* Date of Filing (date.filed)
+* Link to Filing (edgar.link)
+
+For example: gathering the index of 8-K filings from 1995 to 1996 (showing the first 6 rows)
+
+```{r}
+getIndex(years = 1995:1996, quarter = 1:4, form_types = c("8-K")) %>% 
+  head()
+```
+
+First we will use the funciton getIndex to gather the SEC edgar links to the 10-K filings
+
+```{r}
+inc_links <- getIndex(years = 1994:2019, quarter = 1:4, form_types = c("10-K", "10-K405"))
+```
+
+Extract state funciton: most 10-K filings include the state abbreviation in the header.  For filings that have no state in the filing header, we will rely on markers found to indicate a reference to the state of incorporation.  For example, a filing may state:
+
+"Incorporation XYZ was incorporated in Delaware"
+
+The function below will match "Delaware" to the list of US states (and territories) and return its associated abbreviation DE.
+
+The filingInfo funciton, loaded below, takes a file url and returns a dataframe which includes the state of the incorporation and filing period.  Optional arguments include the number of lines of the file to read and the state markers to look for (e.g. 'state or other jurisdiction').
+
+```{r}
+source("./src/filingInfo.R")
+
+# example below
+
+filingInfo(file_link = "https://www.sec.gov/Archives/edgar/data/720695/0000950127-95-000018.txt",
+          state_markers = c("state or other jur","incorporated in", "state of inco", "incorporated under", "incorporated in", "state or"),
+         file_lines = 2500)
+```
+
+Initializing list for data collection
+
+```{r}
+sec_data <- list()
+```
+
+Looping over 10-K filings, extracting state abbreviation
+
+NOTE: THE CODE BELOW ONLY RETURNS FILING INFO FOR THE FIRST 10 FILINGS.
+
+```{r}
+
+for (file_link in inc_links$edgar.link[1:10]){
+  
+  sec_data[[file_link]] <- filingInfo(file_link = file_link,
+         state_markers = c("state or other jur","incorporated in", "state of inco", "incorporated under", "incorporated in", "state or"),
+         file_lines = 2500)
+}
+
+```
+
+Binding rows of returned data frames
+
+```{r}
+filing_info <- bind_rows(sec_data)
+```
+
+Removing all variables and dataframes used in the loop, leaving only the dataframe where state was added, cleanHTML function and states dataframe
+
+```{r, message=FALSE}
+#install.packages("gdata")
+library(gdata)
+
+states <- data.frame(state_abb = c(state.abb, "DC", "DC", "US", "PR"),
+                       state = tolower(c(state.name, "District of Columbia", "Washington D", "United States", "Puerto Rico")))
+ 
+keep(inc_links, filing_info, states, sure = TRUE)
+```
+
+Here is a preview of the completed dataframe with the state abbreviaiton:
+
+```{r}
+filing_info %>% 
+  head(10)
+```
+
+After the above code completes, we need to take a couple steps to clean up the state variable:
+
+* Remove state values that are not in the US
+* Remove asset-backed securities
+* remove NA values
+* filter url cik to match cik from text
+
+Creating list of Asset-backed Securities to exclude these from our final dataset
+
+```{r, message=FALSE, warning=FALSE, error=FALSE}
+
+abs_ciks <- getIndex(years = 1994:2019, quarter = 1:4, form_types = c("10-D", "ABS-EE")) %>% 
+  distinct(cik) %>% 
+  .$cik
+```
+
+Saving full data set before editing
+
+```{r}
+filing_info %>% 
+  mutate(state = ifelse(state %in% states$state_abb, state, NA)) %>% 
+  filter(!(cik %in% abs_ciks) & !is.na(state)) %>% 
+  left_join(inc_links, by = c("edgar.link")) %>%
+  distinct() %>% 
+  write_csv("./state_inc_full.csv")
+```
+
+Editing current data set:
+
+```{r}
+filing_info <- filing_info %>% 
+  mutate(state = ifelse(state %in% states$state_abb, state, NA)) %>% 
+  filter(!(cik %in% abs_ciks) & !is.na(state)) %>% 
+  filter(link_cik == cik) %>% 
+  select(-link_cik) %>% 
+  distinct()
+```
+
+Adding info provided in filing index
+
+```{r}
+filing_info <- filing_info %>% 
+  left_join(inc_links, by = c("edgar.link", "cik"))
+```
+
+
+Using the lubridate package to convert filing_period to a data format consistent with the other data variable we have (data.filed):
+
+```{r, message=FALSE}
+#install.packages("lubridate")
+library(lubridate)
+
+filing_info <- filing_info %>% 
+  mutate(date.filed = as.Date(date.filed),
+         filing_period = as.Date(filing_period, format = "%Y%m%d", optional = TRUE))
+```
+
+Previewing the current dataframe after extracting filing period:
+
+```{r}
+filing_info %>% 
+  head(10)
+```
+
+
+Adding a flag for 1995 filings that appear in a parent/subsidiary filing- these observations have a file structure that is prone to error and should be confirmed
+
+```{r}
+parent_sub_cik <- read_csv("../data/state_inc_full.csv") %>% 
+  mutate(year = year(date.filed)) %>% 
+  group_by(cik, year) %>% 
+  filter(n() > 1) %>% 
+  distinct(cik) %>% 
+  .$cik
+```
+
+Flag for 1995 parent/subsidiary
+
+```{r}
+filing_info <- filing_info %>% 
+  mutate(sub_1995 = cik %in% parent_sub_cik & year(date.filed) == 1995)
+```
+
+Finally, we can write the data to a csv for further analysis in excel, stata, SAS, etc.
+
+```{r}
+filing_info %>% 
+  write_csv("./state_inc.csv")
+```
